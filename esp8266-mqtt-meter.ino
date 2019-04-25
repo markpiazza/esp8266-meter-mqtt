@@ -6,11 +6,13 @@
 * 
 * EPS8266MOD       - https://github.com/nodemcu/nodemcu-devkit-v1.0
 * PubSubClient     - https://github.com/knolleary/pubsubclient
+* NTPClient        - https://github.com/arduino-libraries/NTPClient
 *****************************************************************************************/
 #include <Arduino.h>
 #include <ESP8266WiFi.h>  // ESP8266 Wifi and http server 
 #include <PubSubClient.h> // mqtt service
-#include <WiFiUdp.h>    // for ntp
+#include <WiFiUdp.h>      // for ntp
+#include <NTPClient.h>    // ntp client
 
 /**
  * D0 - GPIO16 - MCU pin 16 - red led
@@ -41,34 +43,33 @@
 
 const char *compileDate               = __DATE__ " " __TIME__;
 const char *sensorString              = SENSOR_FAMILY "-" SENSOR_NAME "-" SENSOR_ID;
-const char *ntpServerName             = "time.nist.gov";
 const char *ssid                      = "Colt45";          
 const char *pass                      = "zoeythecat2012";
 const char *mqttServer                = "192.168.1.177";
 const char *mqttTopic                 = TOPIC_PREFIX "/" SENSOR_NAME;
 
+const char *ntpPoolServerName         = "time.nist.gov";
+
+const long ntpOffsetS                 = -4 * 60 * 60; // -4 hours * 60 min * 60 sec 
+const unsigned long ntpUpdateIntervalMs = 10 * 60 * 1000;  // 10 min * 60 sec * 1000 ms
+
 const unsigned int mqttPort           = 1883;     // MQTT port number. default is 1883
 const unsigned int httpPort           = 80;       // HTTP port number. 
-unsigned int ntpPort                  = 2390;     // NTP port number
-
-const int NTP_PACKET_SIZE             = 48;       // NTP time stamp is in the first 48 bytes of the message
-
-byte packetBuffer[NTP_PACKET_SIZE];               // Buffer to hold incoming and outgoing packets
 
 unsigned int mqttFailures             = 0;
 
+volatile unsigned long sysTime; 
 volatile unsigned long lastMicros;
-
-unsigned long sysTime;
 
 volatile unsigned int pulses          = 0;
 volatile unsigned int pulsesLast      = 0;
 volatile unsigned int pulsesKept      = 0;
 volatile unsigned int pulsesPeriods   = 0;
 
-WiFiUDP udp;
+WiFiUDP ntpUDP;
 WiFiServer server(httpPort);
 WiFiClient wifiClient;
+NTPClient timeClient(ntpUDP, ntpPoolServerName, ntpOffsetS, ntpUpdateIntervalMs);
 os_timer_t myTimer;
 
 String lastPayload;
@@ -118,53 +119,6 @@ void pulseHandler() {
     lastMicros = micros();
     Serial.println ("pulse: " + String(pulses));
   }
-}
-
-
-/**
- * get time
- */
-unsigned long inline ntpUnixTime (UDP &udp) {
-  static int udpInited = udp.begin(123); // open socket on arbitrary port
-  const long ntpFirstFourBytes = 0xEC0600E3; // NTP request header
-  
-  if (!udpInited)
-    return 0;
-  
-  udp.flush();
-  
-  if (!(udp.beginPacket(ntpServerName, 123) // 123 is the NTP port
-   && udp.write((byte *)&ntpFirstFourBytes, 48) == 48
-   && udp.endPacket()))
-    return 0;       // sending request failed
-
-  const int pollIntv = 150;   // poll every this many ms
-  const byte maxPoll = 15;    // poll up to this many times
-  int pktLen;       // received packet length  
-  for (byte i=0; i<maxPoll; i++) {
-    if ((pktLen = udp.parsePacket()) == 48)
-      break;
-    delay(pollIntv);
-  }
-  
-  if (pktLen != 48)
-    return 0;       // no correct packet received
-  
-  const byte useless = 40;
-  for (byte i = 0; i < useless; ++i)
-    udp.read();
-  
-  unsigned long time = udp.read();  // NTP time
-  for (byte i = 1; i < 4; i++)
-    time = time << 8 | udp.read();
-  
-  time += (udp.read() > 115 - pollIntv/8);
-
-  // Discard the rest of the packet
-  udp.flush();
-  
-  // convert NTP time to Unix time
-  return time - 2208988800ul;   
 }
 
 
@@ -263,18 +217,6 @@ void blinkLed(){
 }
 
 
-/**
- * printStartup
- */
-void printStartup() {
-  Serial.println();
-  Serial.print("Compile Date: ");
-  Serial.println(compileDate);
-  Serial.print("Broker: ");
-  Serial.print(mqttServer);
-  Serial.print(" Topic: "); 
-  Serial.println(mqttTopic);
-}
 
 
 /**
@@ -285,6 +227,9 @@ String getPayload(){
   int wattHours = pulsesKept * KH;
   double watts = 3600 * wattHours / seconds;
   unsigned long upTime = (unsigned long) millis()/1000;
+  timeClient.update();
+  sysTime = timeClient.getEpochTime();
+  
   String payload = "{";
   payload += "\"pulses\":"; 
   payload += pulsesKept;
@@ -299,7 +244,7 @@ String getPayload(){
   payload += ", \"upTime\":";
   payload +=  upTime;
   payload += ", \"sysTime\":";
-  payload += (sysTime+upTime); 
+  payload += sysTime; 
   payload += "}";
   return payload;
 }
@@ -311,7 +256,13 @@ String getPayload(){
 void setup() {
   Serial.begin(SERIAL_SPEED);
   delay(10);
-  printStartup();
+  Serial.println();
+  Serial.print("Compile Date: ");
+  Serial.println(compileDate);
+  Serial.print("Broker: ");
+  Serial.print(mqttServer);
+  Serial.print(" Topic: "); 
+  Serial.println(mqttTopic);
 
   pinMode(WIFI_LED_PIN, OUTPUT);
   pinMode(RED_LED_PIN, OUTPUT);
@@ -327,11 +278,14 @@ void setup() {
   timerInit();
   wifiConnect();
   server.begin();
-  udp.begin(ntpPort);
 
-  sysTime = ntpUnixTime(udp);
+  timeClient.begin();
+  timeClient.update();
   Serial.print("NTP Update: ");
-  Serial.println(sysTime);
+  Serial.print(timeClient.getEpochTime());
+  Serial.print(" - ");
+  Serial.println(timeClient.getFormattedTime());
+
 
   Serial.println("READY!");
   Serial.println();
@@ -344,10 +298,10 @@ void setup() {
 void loop() {
   if (WiFi.status() != WL_CONNECTED) {  
     wifiConnect(); 
+
   }
   httpServe(); // process http connections
   processTick(); // process tick
   mqttConnect(); // reconnect to mqtt if needed
-  
   yield();
 }

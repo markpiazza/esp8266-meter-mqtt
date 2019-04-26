@@ -6,6 +6,7 @@
 * 
 * EPS8266MOD       - https://github.com/nodemcu/nodemcu-devkit-v1.0
 * PubSubClient     - https://github.com/knolleary/pubsubclient
+*                  - https://pubsubclient.knolleary.net/api.html
 * NTPClient        - https://github.com/arduino-libraries/NTPClient
 *****************************************************************************************/
 #include <Arduino.h>
@@ -41,17 +42,16 @@
 #define KH                            3.6         // kh constant 
 #define KS                            KH/3600     // ks constant
 
+#define NTP_OFFSET_SEC                -4*60*60    // -4 hours * 60 min * 60 sec
+#define NTP_UPDATE_INT_MS             10*60*1000  // 10 min * 60 sec * 1000 ms
+
 const char *compileDate               = __DATE__ " " __TIME__;
 const char *sensorString              = SENSOR_FAMILY "-" SENSOR_NAME "-" SENSOR_ID;
 const char *ssid                      = "Colt45";          
 const char *pass                      = "zoeythecat2012";
 const char *mqttServer                = "192.168.1.177";
 const char *mqttTopic                 = TOPIC_PREFIX "/" SENSOR_NAME;
-
 const char *ntpPoolServerName         = "time.nist.gov";
-
-const long ntpOffsetS                 = -4 * 60 * 60; // -4 hours * 60 min * 60 sec 
-const unsigned long ntpUpdateIntervalMs = 10 * 60 * 1000;  // 10 min * 60 sec * 1000 ms
 
 const unsigned int mqttPort           = 1883;     // MQTT port number. default is 1883
 const unsigned int httpPort           = 80;       // HTTP port number. 
@@ -69,21 +69,12 @@ volatile unsigned int pulsesPeriods   = 0;
 WiFiUDP ntpUDP;
 WiFiServer server(httpPort);
 WiFiClient wifiClient;
-NTPClient timeClient(ntpUDP, ntpPoolServerName, ntpOffsetS, ntpUpdateIntervalMs);
+PubSubClient mqttClient(mqttServer, mqttPort, wifiClient);
+NTPClient timeClient(ntpUDP, ntpPoolServerName, NTP_OFFSET_SEC, NTP_UPDATE_INT_MS);
 os_timer_t myTimer;
 
 String lastPayload;
 bool tickOccured;
-
-
-/**
- * mqtt callback
- */
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  Serial.println("mqtt callback invoked. not implemented.");
-}
-
-PubSubClient mqttClient(mqttServer, mqttPort, mqttCallback, wifiClient);
 
 
 /**
@@ -129,7 +120,7 @@ void wifiConnect() {
   Serial.println("Connecting to: " + String(ssid));
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, pass);
-  while (WiFi.status() != WL_CONNECTED ) {
+  while (WiFi.status() != WL_CONNECTED) {
     blinkLed();
   }
   Serial.println("WiFi connected");  
@@ -140,6 +131,8 @@ void wifiConnect() {
 
 /**
  * mqttConnect
+ * connect to the mqtt broker if not currently connected
+ * and send a keepalive signal
  */
 void mqttConnect(){
   if (WiFi.status() == WL_CONNECTED) {
@@ -147,27 +140,28 @@ void mqttConnect(){
       yield();
       if (mqttClient.connect(sensorString)) {
         yield();
-        mqttClient.publish("welcome", sensorString);
         Serial.println("mqtt connected");
       }
     }
-
+  
     if (mqttClient.connected())
+      // loop acts like a keep alive signal
       mqttClient.loop();
   }
 }
 
 
 /**
- * http serve
- */
-void httpServe(){
+ * processHttp
+ */ 
+void processHttp(){
+  // listen for incoming clients
   WiFiClient client = server.available();
-  if ( client ) {
-    String req = client.readStringUntil( '\r' );
+  if (client) {
+    String req = client.readStringUntil('\r');
     client.flush();
-    if ( req.indexOf( "GET" ) != -1 ) {
-      client.print( lastPayload  ); 
+    if (req.indexOf("GET") != -1) {
+      client.print(lastPayload); 
     }
     client.flush();
   }
@@ -176,6 +170,7 @@ void httpServe(){
 
 /**
  * processTick
+ * the interrupt timer for mqtt update has fired 
  */
 void processTick(){
   if (tickOccured == true) {
@@ -184,6 +179,7 @@ void processTick(){
     lastPayload = payload;
     Serial.println(payload);
 
+    // publish the mqtt topic
     if (mqttClient.publish(mqttTopic, (char*) payload.c_str())) {
       Serial.println("mqtt publish ok");
       blinkLed();  
@@ -192,14 +188,6 @@ void processTick(){
       pulsesKept = 0;
     } else {
       Serial.println("mqtt publish fail");
-      if (mqttClient.connected()) {
-        Serial.println("mqtt connection still up");
-      } else {
-        Serial.println("mqtt connection down");
-        if (mqttClient.connect(sensorString)) {
-          yield();
-        }
-      }
     }
     tickOccured = false;
   }
@@ -208,15 +196,14 @@ void processTick(){
 
 /**
  * blinkLed 
+ * blink the wifi led on and off 
  */
 void blinkLed(){
   digitalWrite( WIFI_LED_PIN, LOW ); // on
   delay(100);
   digitalWrite( WIFI_LED_PIN, HIGH ); // off
-  delay( 100 );
+  delay(100);
 }
-
-
 
 
 /**
@@ -286,7 +273,6 @@ void setup() {
   Serial.print(" - ");
   Serial.println(timeClient.getFormattedTime());
 
-
   Serial.println("READY!");
   Serial.println();
 }
@@ -298,10 +284,9 @@ void setup() {
 void loop() {
   if (WiFi.status() != WL_CONNECTED) {  
     wifiConnect(); 
-
   }
-  httpServe(); // process http connections
-  processTick(); // process tick
-  mqttConnect(); // reconnect to mqtt if needed
+  mqttConnect();
+  processHttp();
+  processTick();
   yield();
 }
